@@ -1,0 +1,9 @@
+[project]
+name = "humanoid"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mujoco>=3.5.0",
+]

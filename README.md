@@ -1,0 +1,1 @@
+Playing with humanoid (Booster T1), assets from [mujoco-menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/main/booster_t1).
