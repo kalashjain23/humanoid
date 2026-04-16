@@ -13,13 +13,13 @@ def print_joint_and_actuators(model):
         print(f"Actuator {i}: {model.actuator(i).name}")
         
 def bent_pose(data):
-    data.ctrl[11] = -0.5
-    data.ctrl[14] = 0.5
-    data.ctrl[15] = -0.3
+    data.qpos[18] = -0.5
+    data.qpos[21] = 0.5
+    data.qpos[22] = -0.3
     
-    data.ctrl[17] = -0.5
-    data.ctrl[20] = 0.5
-    data.ctrl[21] = -0.3
+    data.qpos[24] = -0.5
+    data.qpos[27] = 0.5
+    data.qpos[28] = -0.3
     
     return data
 
