@@ -5,21 +5,9 @@ import numpy as np
 from torch.optim.adam import Adam
 
 from model import Actor, Critic
-from reward import upright, forward_velocity
+from running_normalizer import RunningNormalizer
+from reward import upright, forward_velocity, height_reward, control_cost
 
-        
-def bent_pose(data):
-    # bent left leg
-    data.qpos[18] = -0.5
-    data.qpos[21] = 0.5
-    data.qpos[22] = -0.3
-    
-    # bent right leg
-    data.qpos[24] = -0.5
-    data.qpos[27] = 0.5
-    data.qpos[28] = -0.3
-    
-    return data
 
 def get_observation(model, data):
     sensors_data = np.array([])
@@ -32,11 +20,15 @@ def get_observation(model, data):
     
     return obs
 
-def reward_function(data):
-    return forward_velocity(data) + (0.1 * upright(data))
+def reward_function(data, step):
+    survival_bonus = min(step / 1000.0, 1.0)  # increases from 0 to 1 over 1000 steps to promote being alive
+
+    return 5.0 * (height_reward(data) * upright(data) * control_cost(data)) * (1.0 + survival_bonus)
 
 def check_termination(data):
-    return True if data.body("Waist").xpos[2] < 0.5 else False # initially waist is z=0.584
+    trunk_z = data.body("Trunk").xpos[2]
+    trunk_upright = data.body("Trunk").xmat[8]
+    return trunk_z < 0.45 or trunk_upright < 0.7
 
 def compute_gae(rewards, values, dones, gamma, lam):
     T = len(rewards)
@@ -67,116 +59,189 @@ def update_networks(
     returns,
     e: float,
     epoch: int,
+    minibatch_size: int,
 ):
     # normalize advantages
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     
+    batch_size = obs_batch.shape[0]
+    minibatch_size = minibatch_size
+    
     for _ in range(epoch):
-        # get log_probs from the updated actor
-        mean = actor(obs_batch)
-        std = actor.log_std.exp()
-        dist = torch.distributions.Normal(mean, std)
-        new_log_probs = dist.log_prob(actions_batch).sum(-1)
+        indices = torch.randperm(batch_size)
         
-        # calculate actor loss
-        ratio = (new_log_probs - old_log_probs).exp()
-        actor_loss = -torch.minimum(ratio * advantages, torch.clamp(ratio, 1-e, 1+e) * advantages).mean()
-        
-        # calculate critic loss
-        values = critic(obs_batch).squeeze()
-        critic_loss = nn.functional.mse_loss(values, returns)
-        
-        # update the networks
-        actor_opt.zero_grad()
-        actor_loss.backward()
-        actor_opt.step()
+        for start in range(0, batch_size, minibatch_size):
+            idx = indices[start:start+minibatch_size]
+            mb_obs = obs_batch[idx]
+            mb_actions = actions_batch[idx]
+            mb_old_log_probs = old_log_probs[idx]
+            mb_advantages = advantages[idx]
+            mb_returns = returns[idx]
+            
+            # get log_probs from the updated actor
+            mean = actor(mb_obs)
+            std = actor.log_std.exp()
+            dist = torch.distributions.Normal(mean, std)
+            new_log_probs = dist.log_prob(mb_actions).sum(-1)
+            entropy = dist.entropy().sum(-1).mean()
+            
+            # calculate actor loss
+            ratio = (new_log_probs - mb_old_log_probs).exp()
+            actor_loss = -torch.minimum(ratio * mb_advantages, torch.clamp(ratio, 1-e, 1+e) * mb_advantages).mean()
+            actor_loss = actor_loss - 0.01 * entropy
+            
+            # calculate critic loss
+            values = critic(mb_obs).squeeze()
+            critic_loss = nn.functional.mse_loss(values, mb_returns)
+            
+            # update the networks
+            actor_opt.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), 0.5)
+            actor_opt.step()
 
-        critic_opt.zero_grad()
-        critic_loss.backward()
-        critic_opt.step()
+            critic_opt.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
+            critic_opt.step()
     
 
 def main():
     iterations = 1000
-    rollout_length = 1000
-    gamma = 0.99
+    checkpoint = 200
+    rollout_length = 1024
+    gamma = 0.95
     lam = 0.95
     e = 0.2
     epoch = 5
+    actor_lr = 1e-4
+    critic_lr = 1e-4
+    num_envs = 16
+    minibatch_size = 512
     
     model = mujoco.MjModel.from_xml_path("booster_t1/scene.xml")
-    data = mujoco.MjData(model)
+    datas = [mujoco.MjData(model) for _ in range(num_envs)]
+    obs_histories = []
     
+    obs_normalizer = RunningNormalizer(168)
     actor = Actor()
     critic = Critic()
     all_rewards = []
     
-    critic_opt = Adam(critic.parameters(), lr=0.001)
-    actor_opt = Adam(actor.parameters(), lr=0.001)
+    critic_opt = Adam(critic.parameters(), lr=critic_lr)
+    actor_opt = Adam(actor.parameters(), lr=actor_lr)
+    actor_scheduler = torch.optim.lr_scheduler.LinearLR(
+      actor_opt, start_factor=1.0, end_factor=0.0, total_iters=iterations
+    )
+    critic_scheduler = torch.optim.lr_scheduler.LinearLR(
+        critic_opt, start_factor=1.0, end_factor=0.0, total_iters=iterations
+    )
+    
+    ctrl_low = torch.tensor(model.actuator_ctrlrange[:, 0], dtype=torch.float32)
+    ctrl_high = torch.tensor(model.actuator_ctrlrange[:, 1], dtype=torch.float32)
+
+    for i in range(1, iterations+1):
+        termination_count = 0
+        obs_histories = []
+        ep_steps = [0] * num_envs
         
-    for i in range(iterations):
-        # get humanoid in bent pose as the default pose
-        mujoco.mj_resetData(model, data)
-        data = bent_pose(data)
-        mujoco.mj_forward(model, data)
+        for d in datas:
+            # reset to initial pose
+            mujoco.mj_resetDataKeyframe(model, d, 0)
+            mujoco.mj_forward(model, d)
+
+            first_obs = get_observation(model, d)
+            obs_histories.append([first_obs, first_obs, first_obs]) # 168 dims for the networks
         
-        first_obs = get_observation(model, data)
-        obs_history = [first_obs, first_obs, first_obs] # 168 dims for the networks
-        rollouts = []
+        env_rollouts = [[] for _ in range(num_envs)]
+        home_ctrl = torch.tensor(datas[0].ctrl.copy(), dtype=torch.float32)
         
         for _ in range(rollout_length):
-            stacked_obs = torch.tensor(np.concatenate(obs_history), dtype=torch.float32)
-            
-            # calculating actor log probs
-            mean = actor(stacked_obs)
-            std = actor.log_std.exp()
-            dist = torch.distributions.Normal(mean, std)
-            action = dist.sample().detach()
-            log_prob = dist.log_prob(action).sum(-1).detach()
-            
-            # applying the action
-            data.ctrl[:] = action.detach().numpy()
-            mujoco.mj_step(model, data)
-            
-            # calculating the reward (reward function) and value (by critic)
-            reward = torch.tensor(reward_function(data), dtype=torch.float32)
-            value = critic(stacked_obs).squeeze().detach()
-            done = check_termination(data)
-            
-            # update history
-            new_obs = get_observation(model, data)
-            obs_history.pop(0)
-            obs_history.append(new_obs)
-            
-            if done:
-                mujoco.mj_resetData(model, data)
-                data = bent_pose(data)
-                mujoco.mj_forward(model, data)
+            for env_idx, d in enumerate(datas):
+                raw_obs = np.concatenate(obs_histories[env_idx])
+                stacked_obs = torch.tensor(obs_normalizer.normalize(raw_obs), dtype=torch.float32)
                 
-                # reset obs history
-                first_obs = get_observation(model, data)
-                obs_history = [first_obs, first_obs, first_obs]
+                # calculating actor log probs
+                mean = actor(stacked_obs)
+                std = actor.log_std.exp()
+                dist = torch.distributions.Normal(mean, std)
+                raw_action = dist.sample().detach()
+                log_prob = dist.log_prob(raw_action).sum(-1).detach()
                 
-            rollouts.append((stacked_obs, action, log_prob, reward, value, done))
+                # applying the action on top of home control position
+                action_scaled = home_ctrl + raw_action * 0.3
+                action_scaled = torch.clamp(action_scaled, ctrl_low, ctrl_high)
+                d.ctrl[:] = action_scaled.numpy()
+                for _ in range(5):
+                    mujoco.mj_step(model, d)
                 
-        obs_batch = torch.stack([r[0] for r in rollouts])
-        actions_batch = torch.stack([r[1] for r in rollouts])
-        old_log_probs = torch.stack([r[2] for r in rollouts])
-        rewards = torch.stack([r[3] for r in rollouts])
-        values = torch.stack([r[4] for r in rollouts])
-        dones = [r[5] for r in rollouts]
+                # calculating the reward (reward function) and value (by critic)
+                ep_steps[env_idx] += 1
+                reward = torch.tensor(reward_function(d, ep_steps[env_idx]), dtype=torch.float32)
+                value = critic(stacked_obs).squeeze().detach()
+                done = check_termination(d)
+                
+                # update history
+                new_obs = get_observation(model, d)
+                obs_histories[env_idx].pop(0)
+                obs_histories[env_idx].append(new_obs)
+                
+                if done:
+                    mujoco.mj_resetDataKeyframe(model, d, 0)
+                    mujoco.mj_forward(model, d)
+                    termination_count += 1
+                    ep_steps[env_idx] = 0
+
+                    # reset obs history
+                    first_obs = get_observation(model, d)
+                    obs_histories[env_idx] = [first_obs, first_obs, first_obs]
+                
+                env_rollouts[env_idx].append((stacked_obs, raw_action, log_prob, reward, value, done))
+                
+        all_obs, all_actions, all_log_probs, all_advantages, all_returns, all_rewards_cat = [], [], [], [], [], []
         
-        advantages, returns = compute_gae(rewards, values, dones, gamma, lam)
-        update_networks(actor, actor_opt, critic, critic_opt, obs_batch, actions_batch, old_log_probs, advantages, returns, e, epoch)
+        for env_idx in range(num_envs):
+            rollout = env_rollouts[env_idx]
+            obs = torch.stack([r[0] for r in rollout])
+            actions = torch.stack([r[1] for r in rollout])
+            log_probs = torch.stack([r[2] for r in rollout])
+            rewards = torch.stack([r[3] for r in rollout])
+            values = torch.stack([r[4] for r in rollout])
+            dones = [r[5] for r in rollout]
+
+            adv, ret = compute_gae(rewards, values, dones, gamma, lam)
+            all_obs.append(obs)
+            all_actions.append(actions)
+            all_log_probs.append(log_probs)
+            all_advantages.append(adv)
+            all_returns.append(ret)
+            all_rewards_cat.append(rewards)
+            
+        obs_batch = torch.cat(all_obs)
+        obs_normalizer.update(obs_batch.numpy())
+        actions_batch = torch.cat(all_actions)
+        old_log_probs = torch.cat(all_log_probs)
+        advantages = torch.cat(all_advantages)
+        returns = torch.cat(all_returns)
+  
+        update_networks(actor, actor_opt, critic, critic_opt, obs_batch, actions_batch, old_log_probs, advantages, returns, e, epoch, minibatch_size)
         
-        all_rewards.append(rewards.mean().item())
-        print(f"iter {i}, mean_reward={rewards.mean():.3f}")
+        actor_scheduler.step()
+        critic_scheduler.step()
         
-    torch.save({
-        'actor': actor.state_dict(),
-        'critic': critic.state_dict(),
-        'rewards': all_rewards,
-    }, 'checkpoint.pt')
+        mean_reward = torch.cat(all_rewards_cat).mean().item()
+        all_rewards.append(mean_reward)
+        print(f"iter {i}, mean_reward={mean_reward:.3f}, deaths={termination_count}")
+        
+        if i % checkpoint == 0:
+            torch.save({
+                'actor': actor.state_dict(),
+                'critic': critic.state_dict(),
+                'rewards': all_rewards,
+                'obs_mean': obs_normalizer.mean,
+                'obs_var': obs_normalizer.var,
+                'obs_count': obs_normalizer.count,
+            }, f'checkpoint_{i}.pt')
 
 
 if __name__ == "__main__":
