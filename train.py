@@ -9,17 +9,17 @@ from env import stand_reward_function, get_observation, check_termination
     
 
 def main():
-    iterations = 200
-    checkpoint = 25
-    rollout_length = 512
-    epoch = 5
-    num_envs = 128
+    iterations = 200 # number of times we will collect rollouts
+    checkpoint = 25 # save every n'th checkpoint while training
+    rollout_length = 512 # max. number of steps in a rollout
+    epoch = 5 # number of epochs a sample
+    num_envs = 128 # parallel envs
     minibatch_size = 1024
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = mujoco.MjModel.from_xml_path("booster_t1/scene.xml")
     datas = [mujoco.MjData(model) for _ in range(num_envs)]
-    obs_histories = []
+    obs_histories = [] # maintaining last 3 states
     all_rewards = []
     
     obs_normalizer = RunningNormalizer(108)
@@ -27,6 +27,10 @@ def main():
     critic = Critic()
     ppo = PPO(actor, critic, device=device)
     
+    """
+    Linear learning rate scheduler so that policy learns a lot in the beginning
+    and does not regress to low reward behaviour in the end of the training
+    """
     actor_scheduler = torch.optim.lr_scheduler.LinearLR(
         ppo.actor_opt, start_factor=1.0, end_factor=0.0, total_iters=iterations
     )
@@ -43,18 +47,19 @@ def main():
         ep_steps = [0] * num_envs
         
         for d in datas:
-            # reset to initial pose
+            # reset to initial pose in every env
             mujoco.mj_resetDataKeyframe(model, d, 0)
             mujoco.mj_forward(model, d)
 
             first_obs = get_observation(model, d)
-            obs_histories.append([first_obs, first_obs, first_obs]) # 108 dims for the networks
+            obs_histories.append([first_obs, first_obs, first_obs]) # last 3 states for the networks
         
         env_rollouts = [[] for _ in range(num_envs)]
         home_ctrl = torch.tensor(datas[0].ctrl.copy(), dtype=torch.float32).to(device)
         
         for _ in range(rollout_length):
             for env_idx, d in enumerate(datas):
+                # normalizing observation as it contains information that have different ranges
                 raw_obs = np.concatenate(obs_histories[env_idx])
                 norm_obs = obs_normalizer.normalize(raw_obs)
                 stacked_obs = torch.tensor(norm_obs, dtype=torch.float32).to(device)
@@ -67,6 +72,7 @@ def main():
                 log_prob = dist.log_prob(raw_action).sum(-1).detach()
                 
                 # applying the action on top of home control position
+                # indices 10:23 are the waist + leg actuators (indices 0:10 are head + arms)
                 action_scaled = home_ctrl.clone()
                 action_scaled[10:23] += raw_action * 0.3
                 action_scaled = torch.clamp(action_scaled, ctrl_low, ctrl_high)
@@ -86,6 +92,7 @@ def main():
                 obs_histories[env_idx].append(new_obs)
                 
                 if done:
+                    # resetting env if terminated
                     mujoco.mj_resetDataKeyframe(model, d, 0)
                     mujoco.mj_forward(model, d)
                     termination_count += 1
@@ -115,18 +122,21 @@ def main():
             all_advantages.append(adv)
             all_returns.append(ret)
             all_rewards_cat.append(rewards)
-            
-        raw_obs_batch = np.stack([r[0] for rollout in env_rollouts for r in rollout])
-        obs_normalizer.update(raw_obs_batch)
   
         obs_batch = torch.cat(all_obs).to(device)
         actions_batch = torch.cat(all_actions).to(device)
         old_log_probs = torch.cat(all_log_probs).to(device)
         advantages = torch.cat(all_advantages).to(device)
         returns = torch.cat(all_returns).to(device)
+        
+        # updating the observation normalizer to update the running mean and variance
+        raw_obs_batch = np.stack([r[0] for rollout in env_rollouts for r in rollout])
+        obs_normalizer.update(raw_obs_batch)
   
+        # updating actor and critic networks
         ppo.update_networks(obs_batch, actions_batch, old_log_probs, advantages, returns, epoch, minibatch_size)
         
+        # linear lr scheduler step
         actor_scheduler.step()
         critic_scheduler.step()
         

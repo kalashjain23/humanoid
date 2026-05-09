@@ -27,12 +27,18 @@ class PPO:
         self.actor_opt = Adam(actor.parameters(), lr=actor_lr)
     
     def compute_gae(self, rewards, values, dones):
+        """
+        Generalized Advantage Estimation (GAE).
+        
+        Estimates how much better each state is than expected by bootstrapping
+        from the critic value function. lambda trades off bias vs variance.
+        """
         T = len(rewards)
 
         advantages = torch.zeros(T, device=self.device)
         gae = torch.zeros((), device=self.device)
         
-        # calculating GAE for the whole rollout
+        # walk backwards through the rollout so we can bootstrap from future steps
         for t in reversed(range(T)):
             next_value = values[t + 1] if t + 1 < T else torch.zeros((), device=self.device)
             next_nonterminal = torch.tensor(1.0 - float(dones[t]), device=self.device)
@@ -53,15 +59,15 @@ class PPO:
         epoch: int,
         minibatch_size: int,
     ):
-        # normalize advantages
+        # normalize advantages to stabilize PPO updates
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         batch_size = obs_batch.shape[0]
-        minibatch_size = minibatch_size
         
         for _ in range(epoch):
             indices = torch.randperm(batch_size)
             
+            # mini-batch updates: smoother than single-sample SGD, more sample-efficient than full-batch
             for start in range(0, batch_size, minibatch_size):
                 idx = indices[start:start+minibatch_size]
                 mb_obs = obs_batch[idx]
@@ -70,19 +76,20 @@ class PPO:
                 mb_advantages = advantages[idx]
                 mb_returns = returns[idx]
                 
-                # get log_probs from the updated actor
+                # recompute log probs under the current (possibly updated) policy
                 mean = self.actor(mb_obs)
                 std = self.actor.log_std.clamp(min=-2.0).exp()
                 dist = torch.distributions.Normal(mean, std)
                 new_log_probs = dist.log_prob(mb_actions).sum(-1)
                 entropy = dist.entropy().sum(-1).mean()
                 
-                # calculate actor loss
+                # PPO clipped surrogate loss: ratio bounded to [1-e, 1+e] prevents too-large steps
                 ratio = (new_log_probs - mb_old_log_probs).exp()
                 actor_loss = -torch.minimum(ratio * mb_advantages, torch.clamp(ratio, 1-self.e, 1+self.e) * mb_advantages).mean()
+                # entropy bonus encourages exploration so the policy does not collapse early
                 actor_loss = actor_loss - 0.01 * entropy
                 
-                # calculate critic loss
+                # critic learns to predict the return (advantage + value) from GAE
                 values = self.critic(mb_obs).squeeze()
                 critic_loss = nn.functional.mse_loss(values, mb_returns)
                 
