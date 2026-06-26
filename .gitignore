@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Training artifacts
+*.png
+*.log
+
+# macOS
+.DS_Store
