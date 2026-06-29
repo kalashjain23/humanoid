@@ -11,43 +11,47 @@ from env import (
     get_observation,
     check_termination,
     randomize_state,
-    get_foot_contacts
+    get_foot_contacts,
+    base_frame_velocity,
+    initial_phase,
+    VEL_WINDOW,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def sample_command(scale=1.0):
-    """Sample a random velocity command. Forward + turn only (matches goto deployment)."""
-    vx = np.random.uniform(0.0, 0.5) * scale    # forward only, includes stand
-    vy = 0.0                                     # no lateral motion
-    wz = np.random.uniform(-0.5, 0.5) * scale   # full turn range
-    return np.array([vx, vy, wz])
+    """Velocity command: forward-walk (optionally turning) or turn-in-place (vx=0), so the
+    policy learns to rotate without forward speed. Mirrors mjx/mjx_env.py:sample_command."""
+    turn_in_place = np.random.random() < 0.4
+    vx = 0.0 if turn_in_place else np.random.uniform(0.3, 0.6)
+    wz = np.random.uniform(-0.5, 0.5) * scale   # turning eased in by the curriculum scale
+    return np.array([vx, 0.0, wz])
 
 
 def main():
-    iterations = 2500 # number of times we will collect rollouts
-    checkpoint = 100 # save every n'th checkpoint while training
-    resume_from = None # set to a checkpoints/*.pt path to resume
-    rollout_length = 1024 # max. number of steps in a rollout
-    epoch = 5 # number of epochs a sample
-    num_envs = 128 # parallel envs
+    iterations = 2500
+    checkpoint = 100  # save every n'th iteration
+    resume_from = None  # set to a checkpoints/*.pt path to resume
+    rollout_length = 1024
+    epoch = 5
+    num_envs = 128
     minibatch_size = 1024
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     model = mujoco.MjModel.from_xml_path(str(ROOT / "booster_t1/scene.xml"))
     datas = [mujoco.MjData(model) for _ in range(num_envs)]
-    obs_histories = [] # maintaining last 3 states
+    obs_histories = []
     all_rewards = []
 
-    # one policy step in seconds (5 sim substeps), needed for the gait phase clock
+    # one policy step in seconds (5 sim substeps), drives the gait phase clock
     dt_step = model.opt.timestep * 5
 
-    # ---- precompute reward constants from the clean home keyframe (done once) ----
+    # precompute reward constants from the clean home keyframe
     mujoco.mj_resetDataKeyframe(model, datas[0], 0)
     mujoco.mj_forward(model, datas[0])
-    default_pose = datas[0].qpos[17:30].copy()                      # home pose of 13 ctrl joints
-    foot_z0 = np.array([                                            # stance foot height offset
+    default_pose = datas[0].qpos[17:30].copy()
+    foot_z0 = np.array([
         datas[0].body("left_foot_link").xpos[2],
         datas[0].body("right_foot_link").xpos[2],
     ])
@@ -70,27 +74,23 @@ def main():
     for nm in ["Left_Hip_Pitch", "Right_Hip_Pitch", "Left_Knee_Pitch",
                "Right_Knee_Pitch", "Left_Ankle_Pitch", "Right_Ankle_Pitch"]:
         pose_weights[_qpos_idx(nm)] = 0.0
-    knee_idx = np.array([_qpos_idx("Left_Knee_Pitch"), _qpos_idx("Right_Knee_Pitch")])
 
     reward_cfg = {
         'default_pose': default_pose,
         'pose_weights': pose_weights,
         'jnt_lower': jnt_lower,
         'jnt_upper': jnt_upper,
-        'knee_idx': knee_idx,
         'foot_z0': foot_z0,
         'swing_height': 0.08,
+        'dt': dt_step,
     }
     
-    obs_normalizer = RunningNormalizer(130) # normalize only base obs (command appended after)
+    obs_normalizer = RunningNormalizer(130)  # base obs only; command/phase appended after
     actor = Actor()
     critic = Critic()
     ppo = PPO(actor, critic, device=device)
 
-    """
-    Linear learning rate scheduler so that policy learns a lot in the beginning
-    and does not regress to low reward behaviour in the end of the training
-    """
+    # decay LR so the policy does not regress to low-reward behaviour late in training
     actor_scheduler = torch.optim.lr_scheduler.LinearLR(
         ppo.actor_opt, start_factor=1.0, end_factor=0.1, total_iters=iterations
     )
@@ -98,9 +98,7 @@ def main():
         ppo.critic_opt, start_factor=1.0, end_factor=0.1, total_iters=iterations
     )
 
-    # Resume from checkpoint if specified. Loads actor + critic + normalizer + reward history,
-    # and (if available) optimizer states + scheduler step count. If optimizer states missing
-    # from an older checkpoint, advances scheduler by `iter` steps so LR matches.
+    # Older checkpoints lack optimizer/scheduler state: replay scheduler steps so LR matches.
     start_iter = 0
     if resume_from is not None:
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
@@ -130,33 +128,39 @@ def main():
         termination_count = 0
         obs_histories = []
         ep_steps = [0] * num_envs
-        commands = [] # velocity command per env
-        last_actions = [] # previous action per env (used in observation)
-        phases = [] # gait phase [phase_L, phase_R] per env
-        phase_dts = [] # phase increment per step per env (depends on sampled gait freq)
+        commands = []
+        last_actions = []
+        phases = []  # gait phase [phase_L, phase_R] per env
+        phase_dts = []  # phase increment per step (depends on sampled gait freq)
+        pos_hists = []  # (VEL_WINDOW, 2) base-xy history per env, for windowed velocity
+        prev_foot_xys = []  # (2, 2) foot world-xy at previous step, for slip cost
         command_scale = min(i / 300.0, 1.0)
         resample_every = 250  # resample command mid-rollout to break standing-still attractor
         component_sums = {}
         component_count = 0
-        
+
         for d in datas:
-            # reset to randomized initial pose in every env
-            randomize_state(model, d)
+            single, swing_left = randomize_state(model, d)
 
             first_obs = get_observation(model, d)
-            obs_histories.append([first_obs, first_obs, first_obs]) # last 3 states for the networks
+            obs_histories.append([first_obs, first_obs, first_obs])
             commands.append(sample_command(command_scale))
-            last_actions.append(np.zeros(13)) # 13 controllable joints
+            last_actions.append(np.zeros(13))
 
-            # gait clock: feet start antiphase; freq sampled per env
+            # gait clock: phase matched to the RSI pose; freq sampled per env
             gait_freq = np.random.uniform(1.25, 1.75)
-            phases.append(np.array([0.0, np.pi]))
+            phases.append(initial_phase(single, swing_left))
             phase_dts.append(2 * np.pi * dt_step * gait_freq)
+
+            base_xy = d.qpos[:2].copy()
+            pos_hists.append(np.tile(base_xy, (VEL_WINDOW, 1)))
+            prev_foot_xys.append(np.array([d.body("left_foot_link").xpos[:2].copy(),
+                                           d.body("right_foot_link").xpos[:2].copy()]))
         
         env_rollouts = [[] for _ in range(num_envs)]
         home_ctrl = torch.tensor(datas[0].ctrl.copy(), dtype=torch.float32).to(device)
-        
-        dt_step = model.opt.timestep * 5  # one policy step in seconds
+
+        dt_step = model.opt.timestep * 5
         air_times = [np.zeros(2) for _ in range(num_envs)]
         last_contacts = [np.zeros(2, dtype=bool) for _ in range(num_envs)]
   
@@ -167,43 +171,42 @@ def main():
                     commands[env_idx] = sample_command(command_scale)
 
             for env_idx, d in enumerate(datas):
-                # concatenate 3-frame history + command to form full observation
                 base_obs = np.concatenate(obs_histories[env_idx])
                 prev_action = last_actions[env_idx]
-                to_normalize = np.concatenate([base_obs, prev_action])       # 130
+                to_normalize = np.concatenate([base_obs, prev_action])  # 130
                 norm_part = obs_normalizer.normalize(to_normalize)
                 # phase (cos/sin of both feet) appended unnormalized, like the command
-                phase_obs = np.concatenate([np.cos(phases[env_idx]), np.sin(phases[env_idx])]) # 4
-                full_obs = np.concatenate([norm_part, commands[env_idx], phase_obs]) # 137
+                phase_obs = np.concatenate([np.cos(phases[env_idx]), np.sin(phases[env_idx])])  # 4
+                full_obs = np.concatenate([norm_part, commands[env_idx], phase_obs])  # 137
                 stacked_obs = torch.tensor(full_obs, dtype=torch.float32).to(device)
-                
-                # calculating actor log probs
+
                 mean = actor(stacked_obs)
                 std = actor.log_std.clamp(min=-2.0).exp()
                 dist = torch.distributions.Normal(mean, std)
                 raw_action = dist.sample().detach()
                 log_prob = dist.log_prob(raw_action).sum(-1).detach()
-                
-                # applying the action on top of home control position
-                # indices 10:23 are the waist + leg actuators (indices 0:10 are head + arms)
+
+                # apply action as a delta on home ctrl; indices 10:23 are waist + leg actuators
                 action_scaled = home_ctrl.clone()
-                action_scaled[10:23] += raw_action * 0.3
+                action_scaled[10:23] += raw_action * 0.5
                 action_scaled = torch.clamp(action_scaled, ctrl_low, ctrl_high)
                 d.ctrl[:] = action_scaled.cpu().numpy()
                 for _ in range(5):
                     mujoco.mj_step(model, d)
-                    
+
                 left_contact, right_contact = get_foot_contacts(model, d)
                 current_contact = np.array([left_contact, right_contact])
                 first_contact = current_contact & (~last_contacts[env_idx])
 
-                # calculating the reward (reward function) and value (by critic)
                 ep_steps[env_idx] += 1
                 action_np = raw_action.cpu().numpy()
+                # windowed base-frame velocity, computed before pos_hist is advanced
+                lin_vel = base_frame_velocity(d, pos_hists[env_idx], dt_step)
                 reward_val, reward_components = walk_reward_function(
-                    model, d, commands[env_idx],
-                    air_times[env_idx], first_contact, current_contact,
-                    phases[env_idx], reward_cfg,
+                    model, d, commands[env_idx], lin_vel, action_np,
+                    last_actions[env_idx], air_times[env_idx], first_contact,
+                    current_contact, phases[env_idx], prev_foot_xys[env_idx],
+                    reward_cfg,
                 )
                 reward = torch.tensor(reward_val, dtype=torch.float32)
                 for k, v in reward_components.items():
@@ -215,11 +218,14 @@ def main():
                 air_times[env_idx][current_contact] = 0.0
                 air_times[env_idx][~current_contact] += dt_step
                 last_contacts[env_idx] = current_contact
-                
-                # update action history for next step
+
+                base_xy = d.qpos[:2].copy()
+                pos_hists[env_idx] = np.vstack([pos_hists[env_idx][1:], base_xy])
+                prev_foot_xys[env_idx] = np.array([d.body("left_foot_link").xpos[:2].copy(),
+                                                   d.body("right_foot_link").xpos[:2].copy()])
+
                 last_actions[env_idx] = action_np.copy()
-                
-                # update observation history
+
                 new_obs = get_observation(model, d)
                 obs_histories[env_idx].pop(0)
                 obs_histories[env_idx].append(new_obs)
@@ -232,21 +238,26 @@ def main():
                 phases[env_idx] = p
 
                 if done:
-                    # resetting env if terminated
-                    randomize_state(model, d)
+                    single, swing_left = randomize_state(model, d)
                     termination_count += 1
                     ep_steps[env_idx] = 0
 
-                    # reset obs history and command
                     first_obs = get_observation(model, d)
                     obs_histories[env_idx] = [first_obs, first_obs, first_obs]
                     commands[env_idx] = sample_command(command_scale)
                     last_actions[env_idx] = np.zeros(13)
                     air_times[env_idx] = np.zeros(2)
                     last_contacts[env_idx] = np.zeros(2, dtype=bool)
-                    phases[env_idx] = np.array([0.0, np.pi])
-                
-                # store: base_obs (for normalizer), full_obs (for network), action, log_prob, reward, value, done
+
+                    gait_freq = np.random.uniform(1.25, 1.75)
+                    phase_dts[env_idx] = 2 * np.pi * dt_step * gait_freq
+                    phases[env_idx] = initial_phase(single, swing_left)
+
+                    base_xy = d.qpos[:2].copy()
+                    pos_hists[env_idx] = np.tile(base_xy, (VEL_WINDOW, 1))
+                    prev_foot_xys[env_idx] = np.array([d.body("left_foot_link").xpos[:2].copy(),
+                                                       d.body("right_foot_link").xpos[:2].copy()])
+
                 env_rollouts[env_idx].append((to_normalize.copy(), stacked_obs, raw_action, log_prob, reward, value, done))
                 
         all_obs, all_actions, all_log_probs, all_advantages, all_returns, all_rewards_cat = [], [], [], [], [], []
@@ -274,14 +285,12 @@ def main():
         advantages = torch.cat(all_advantages).to(device)
         returns = torch.cat(all_returns).to(device)
         
-        # updating the observation normalizer using only the base obs (108 dims, excluding command)
+        # update normalizer on base obs only (excludes command/phase)
         raw_obs_batch = np.stack([r[0] for rollout in env_rollouts for r in rollout])
         obs_normalizer.update(raw_obs_batch)
-  
-        # updating actor and critic networks
+
         ppo.update_networks(obs_batch, actions_batch, old_log_probs, advantages, returns, epoch, minibatch_size)
-        
-        # linear lr scheduler step
+
         actor_scheduler.step()
         critic_scheduler.step()
         

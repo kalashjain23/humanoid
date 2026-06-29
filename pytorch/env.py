@@ -1,26 +1,24 @@
 import numpy as np
 import mujoco
-from reward import (
-    upright,
-    height_reward,
-    control_cost,
-)
 
+# velocity is tracked as windowed base displacement, not instantaneous qvel, so trunk
+# sway can't fake forward motion. VEL_WINDOW = steps of base-xy history.
+VEL_WINDOW = 50
 
-CONTROLLABLE_JOINTS = [
-    "Waist",
-    "Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
-    "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll",
-    "Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
-    "Right_Knee_Pitch", "Right_Ankle_Pitch", "Right_Ankle_Roll",
-]
+# reference-state init: half the episodes start in single support, one foot lifted to its
+# swing apex, seeding the states a standing reset never reaches.
+SS_PROB = 0.5
+SWING_LIFT = np.array([-0.4, 0.9, 0.25])   # hip_pitch, knee, ankle_pitch deltas
+LEFT_LEG = np.array([1, 4, 5])             # indices into qpos[17:30]
+RIGHT_LEG = np.array([7, 10, 11])
 
 
 def randomize_state(model, data):
-    """Randomize trunk pose and controllable joints, leave arms/head at keyframe."""
+    """Randomize trunk pose and controllable joints, leave arms/head at keyframe.
+    For SS_PROB of episodes, lift one leg into its swing apex (reference-state init).
+    Returns (single, swing_left) so the caller can set the matching gait phase."""
     mujoco.mj_resetDataKeyframe(model, data, 0)
 
-    # randomize trunk orientation: small random tilt around random axis
     angle = np.random.uniform(-0.15, 0.15)
     axis = np.random.randn(3)
     axis /= np.linalg.norm(axis)
@@ -29,24 +27,43 @@ def randomize_state(model, data):
     data.qpos[5] = axis[1] * np.sin(angle / 2.0)
     data.qpos[6] = axis[2] * np.sin(angle / 2.0)
 
-    # randomize trunk height slightly
     data.qpos[2] += np.random.uniform(-0.05, 0.05)
+    data.qpos[17:30] += np.random.uniform(-0.15, 0.15, size=13)
 
-    # randomize only the 13 controllable joints (waist + legs)
-    for name in CONTROLLABLE_JOINTS:
-        jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        qpos_adr = model.jnt_qposadr[jnt_id]
-        data.qpos[qpos_adr] += np.random.uniform(-0.15, 0.15)
+    single = np.random.random() < SS_PROB
+    swing_left = np.random.random() < 0.5
+    if single:
+        legs = LEFT_LEG if swing_left else RIGHT_LEG
+        data.qpos[17 + legs] += SWING_LIFT
 
     mujoco.mj_forward(model, data)
+    return single, swing_left
+
+
+def base_frame_velocity(data, pos_hist, dt, window=VEL_WINDOW):
+    """Windowed displacement velocity rotated into the base (trunk-yaw) frame.
+    pos_hist is the (window, 2) history of base xy; pos_hist[0] is the oldest sample."""
+    base_xy = data.qpos[:2]
+    R = data.body("Trunk").xmat.reshape(3, 3)
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+    vel_world = (base_xy - pos_hist[0]) / (window * dt)
+    return np.array([
+        np.cos(yaw) * vel_world[0] + np.sin(yaw) * vel_world[1],
+        -np.sin(yaw) * vel_world[0] + np.cos(yaw) * vel_world[1],
+    ])
+
+
+def initial_phase(single, swing_left):
+    """Gait-clock phase at reset: lifted foot at swing apex (phase 0) for single-support
+    starts, a random antiphase point otherwise. Mirrors mjx/mjx_env.py:reset."""
+    if single:
+        return np.array([0.0, np.pi]) if swing_left else np.array([np.pi, 0.0])
+    theta = np.random.uniform(0.0, 2 * np.pi)
+    return np.fmod(np.array([theta, theta + np.pi]) + np.pi, 2 * np.pi) - np.pi
 
 
 def get_foot_contacts(model, data):
-    """
-    Return (left_contact, right_contact) as booleans.
-    Checks every active contact and asks whether either of its two geoms
-    belongs to a foot body.
-    """
+    """Return (left_contact, right_contact): true if any active contact involves that foot body."""
     left_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_foot_link")
     right_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_foot_link")
 
@@ -63,11 +80,8 @@ def get_foot_contacts(model, data):
     return left_contact, right_contact
 
 def get_observation(model, data):
-    """
-    Per-frame observation = 10 (IMU) + 13 (qpos) + 13 (qvel) + 3 (projected gravity) = 39.
-    Stacked 3 frames in the caller -> 117 dims of base obs.
-    Caller appends prev_action (13) and command (3) -> 133 total.
-    """
+    """Per-frame obs = 10 IMU + 13 qpos + 13 qvel + 3 projected gravity = 39.
+    Caller stacks 3 frames then appends prev_action and command."""
     sensors_data = np.array([])
     for i in range(model.nsensor):
         start = model.sensor_adr[i]
@@ -86,19 +100,7 @@ def get_observation(model, data):
     ])
     return obs
 
-def stand_reward_function(data, step):
-    """
-    Reward function to train the humanoid to stand.
-    - rewards being upright, keeping the waist above a particular height.
-    - penalizes strong control commands.
-    """
-    stand_reward = height_reward(data) * upright(data) * control_cost(data)
-    survival_bonus = min(step / 1000.0, 1.0)  # increases from 0 to 1 over 1000 steps to promote being alive
 
-    return (
-        5.0 * stand_reward
-    ) * (1.0 + survival_bonus)
-    
 def get_rz(phi, swing_height=0.08):
     """Target foot height as a function of gait phase (cubic bezier swing profile).
     phi in [-pi, pi]: 0 at stance, peaks at swing_height mid-swing. Vectorized over feet."""
@@ -123,121 +125,75 @@ def get_foot_self_collision(model, data):
     return False
 
 
-def _foot_world_xy_speed(model, data, body_name):
-    """World-frame horizontal speed of a body (for the slip cost)."""
-    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-    vel = np.zeros(6)
-    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, bid, vel, 0)
-    return float(np.linalg.norm(vel[3:5]))
-
-
-def walk_reward_function(model, data, command,
-                         air_times, first_contact, current_contact, phase, cfg):
-    """
-    MuJoCo Playground T1 joystick reward, ported to numpy/MuJoCo.
-
-    Positive: velocity tracking (sigma 0.25), gait-phase tracking, alive bonus,
-    feet air time. Everything else is a small cost (orientation, base rocking,
-    foot slip, foot distance, pose deviation, joint limits, self collision).
-
-    phase: np.array([phase_L, phase_R]) in [-pi, pi] - the gait clock.
-    cfg: precomputed constants dict (default_pose, pose_weights, jnt_lower/upper,
-         knee_idx, foot_z0, swing_height).
-    """
-    # Trunk rotation matrix (3x3). R.T rotates world -> base frame.
+def walk_reward_function(model, data, command, lin_vel, action, prev_action,
+                         air_times, first_contact, current_contact, phase,
+                         prev_foot_xy, cfg):
+    """Walk reward (numpy mirror of mjx/mjx_env.py:reward).
+    lin_vel is windowed base-frame velocity; phase is the gait clock [phase_L, phase_R]."""
     R = data.body("Trunk").xmat.reshape(3, 3)
 
-    # --- velocity tracking in base frame, sigma 0.25 for both ---
-    v_base = R.T @ data.qvel[:3]
-    vx_base, vy_base = v_base[0], v_base[1]
+    # gate tracking on uprightness so the policy can't bank reward while toppling
     omega_base = R.T @ data.qvel[3:6]
-    wz_base = omega_base[2]
-    lin_sigma = 0.15   # tighter: kills lateral drift / sway
-    ang_sigma = 0.25   # forgiving: a tight sigma flattens the yaw gradient when far off
-    lin_err = (command[0] - vx_base) ** 2 + (command[1] - vy_base) ** 2
-    ang_err = (command[2] - wz_base) ** 2
-    tracking_lin_vel = float(np.exp(-lin_err / lin_sigma))
-    tracking_ang_vel = float(np.exp(-ang_err / ang_sigma))
+    lin_err = (command[0] - lin_vel[0]) ** 2 + (command[1] - lin_vel[1]) ** 2
+    ang_err = (command[2] - omega_base[2]) ** 2
+    track_lin = float(np.exp(-lin_err / 0.25))
+    track_ang = float(np.exp(-ang_err / 0.1))   # tight kernel: demand precise yaw match
+    upright = float(np.clip(R[2, 2], 0.0, 1.0))
+    track_lin *= upright
+    track_ang *= upright
 
-    # --- orientation + base rocking costs ---
-    proj_grav = -R[2, :]                       # gravity in trunk frame
-    orientation_cost = float(proj_grav[0] ** 2 + proj_grav[1] ** 2)
-    ang_vel_xy_cost = float(omega_base[0] ** 2 + omega_base[1] ** 2)
+    orient = float(R[2, 0] ** 2 + R[2, 1] ** 2)
+    ang_vel_xy = float(omega_base[0] ** 2 + omega_base[1] ** 2)
 
-    # --- feet air time: signed (penalizes short steps), clipped above at 0.3 ---
+    # air-time bonus per landing once past a short threshold, only while moving
     cmd_norm = float(np.linalg.norm(command))
-    if cmd_norm > 0.1:
-        feet_air_time = float(np.sum(np.minimum(air_times - 0.2, 0.3) * first_contact.astype(float)))
-    else:
-        feet_air_time = 0.0
+    air = float(np.sum(np.clip(air_times - 0.02, 0.0, 0.3) * first_contact.astype(float)))
+    feet_air = air if cmd_norm > 0.1 else 0.0
 
-    # --- feet phase: track the gait clock's target foot height ---
     foot_z = np.array([
         data.body("left_foot_link").xpos[2],
         data.body("right_foot_link").xpos[2],
     ]) - cfg['foot_z0']
-    rz = get_rz(phase, cfg['swing_height'])
-    feet_phase = float(np.exp(-np.sum((foot_z - rz) ** 2) / 0.01))
+    feet_phase = float(np.exp(-np.sum((foot_z - get_rz(phase, cfg['swing_height'])) ** 2) / 0.01))
 
-    # --- feet distance: lateral separation in base yaw frame (fixes crossover) ---
-    lf = data.body("left_foot_link").xpos
-    rf = data.body("right_foot_link").xpos
-    base_yaw = np.arctan2(R[1, 0], R[0, 0])
-    feet_distance = abs(
-        np.cos(base_yaw) * (lf[1] - rf[1]) - np.sin(base_yaw) * (lf[0] - rf[0])
-    )
-    feet_distance_cost = float(np.clip(0.2 - feet_distance, 0.0, 0.1))
+    # feet slip: horizontal foot displacement while planted (kills the skating cheat)
+    foot_xy = np.array([
+        data.body("left_foot_link").xpos[:2],
+        data.body("right_foot_link").xpos[:2],
+    ])
+    foot_speed = np.linalg.norm((foot_xy - prev_foot_xy) / cfg['dt'], axis=1)
+    feet_slip = float(np.sum(foot_speed * current_contact.astype(float)))
 
-    # --- feet slip: horizontal foot speed while in contact ---
-    slip = 0.0
-    if current_contact[0]:
-        slip += _foot_world_xy_speed(model, data, "left_foot_link")
-    if current_contact[1]:
-        slip += _foot_world_xy_speed(model, data, "right_foot_link")
-    feet_slip_cost = float(slip)
-
-    # --- pose cost: weighted deviation from home (walking joints have zero weight) ---
+    action_rate = float(np.sum((action - prev_action) ** 2))
     q = data.qpos[17:30]
-    dq = q - cfg['default_pose']
-    pose_cost = float(np.sum(cfg['pose_weights'] * dq ** 2))
-    joint_dev_knee = float(np.sum(np.abs(dq[cfg['knee_idx']])))
-
-    # --- soft joint position limits (95% of range) ---
+    pose_cost = float(np.sum(cfg['pose_weights'] * (q - cfg['default_pose']) ** 2))
     lower, upper = cfg['jnt_lower'], cfg['jnt_upper']
     mid = 0.5 * (lower + upper)
     half = 0.5 * (upper - lower) * 0.95
-    soft_lo, soft_hi = mid - half, mid + half
-    dof_pos_limit_cost = float(np.sum(np.clip(soft_lo - q, 0.0, None) + np.clip(q - soft_hi, 0.0, None)))
+    dof_lim = float(np.sum(np.clip(mid - half - q, 0.0, None) + np.clip(q - mid - half, 0.0, None)))
 
-    # --- self collision (feet touching each other) ---
     collision = 1.0 if get_foot_self_collision(model, data) else 0.0
 
     components = {
-        "track_lin": 1.0 * tracking_lin_vel,
-        "track_ang": 1.0 * tracking_ang_vel,
-        "orient": -1.0 * orientation_cost,
-        "ang_vel_xy": -0.15 * ang_vel_xy_cost,
-        "air_time": 2.0 * feet_air_time,
+        "track_lin": 2.0 * track_lin,
+        "track_ang": 2.5 * track_ang,
+        "feet_air": 4.0 * feet_air,
         "feet_phase": 1.0 * feet_phase,
-        "feet_dist": -1.0 * feet_distance_cost,
-        "feet_slip": -0.25 * feet_slip_cost,
-        "pose": -1.0 * pose_cost,
-        "jdev_knee": -0.1 * joint_dev_knee,
-        "dof_lim": -1.0 * dof_pos_limit_cost,
-        "collision": -1.0 * collision,
         "alive": 0.25,
+        "orient": -1.0 * orient,
+        "ang_vel_xy": -0.15 * ang_vel_xy,
+        "feet_slip": -1.0 * feet_slip,
+        "action_rate": -0.05 * action_rate,
+        "pose": -1.0 * pose_cost,
+        "dof_lim": -1.0 * dof_lim,
+        "collision": -1.0 * collision,
     }
     total = sum(components.values())
     return total, components
 
 def check_termination(data):
-    """
-    Termination conditions to end the rollout
-    - trunk_z: height of the trunk
-    - trunk_upright: how upright the trunk is (1.0 = perfectly vertical)
-    - trunk_lean: sideways lean of the trunk
-    """
+    """End the rollout if the trunk falls too low, tips over, or leans sideways too far."""
     trunk_z = data.body("Trunk").xpos[2]
     trunk_upright = data.body("Trunk").xmat[8]
     trunk_lean = abs(data.body("Trunk").xmat[6])
-    return trunk_z < 0.45 or trunk_upright < 0.7 or trunk_lean > 0.25
+    return trunk_z < 0.55 or trunk_upright < 0.7 or trunk_lean > 0.3
