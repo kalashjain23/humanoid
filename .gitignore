@@ -12,6 +12,8 @@ wheels/
 # Training artifacts
 *.png
 *.log
+# raw flax checkpoints (intermediate); deployable .pt files are tracked
+*.pkl
 
 # macOS
 .DS_Store
