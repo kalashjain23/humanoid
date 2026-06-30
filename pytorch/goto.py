@@ -81,25 +81,33 @@ phase = np.array([0.0, np.pi])
 phase_dt = 2 * np.pi * dt * gait_freq
 
 waypoints = [
-    np.array([2.5,  -1.5]),
+    np.array([2.0, 0.0]),
 ]
 wp_idx = 0
+STOP_DECAY = 0.9       # per-step command decay once the final goal is reached
+stopping = False
+command = np.zeros(3)
 
 
 with mujoco.viewer.launch_passive(model, data) as viewer:
     while viewer.is_running():
         step_start = time.time()
 
-        if wp_idx < len(waypoints):
+        # advance through waypoints; on the final one, ramp the command down to
+        # zero instead of cutting it (the gait clock finishes its stride before
+        # the freeze kicks in, so it settles into a stand rather than toppling)
+        if not stopping:
             vx, vy, wz, dist = high_level_command(data, waypoints[wp_idx])
             if dist < GOAL_RADIUS:
-                print(f"reached waypoint {wp_idx} at distance {dist:.2f}")
-                wp_idx += 1
-                command = np.array([0.0, 0.0, 0.0])
-            else:
-                command = np.array([vx, vy, wz])
+                print(f"reached waypoint {wp_idx}")
+                if wp_idx < len(waypoints) - 1:
+                    wp_idx += 1
+                    vx, vy, wz, dist = high_level_command(data, waypoints[wp_idx])
+                else:
+                    stopping = True
+            command = np.array([vx, vy, wz])
         else:
-            command = np.array([0.0, 0.0, 0.0])
+            command = command * STOP_DECAY
 
         raw_obs = np.concatenate(obs_history)
         to_normalize = np.concatenate([raw_obs, prev_action])
