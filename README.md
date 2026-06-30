@@ -98,6 +98,16 @@ on, they were all forward motion, so the in-place turn the goto controller asks 
 had never practiced. Broadening the command sampler to include `vx = 0` turns, and gating the
 velocity reward on staying upright, brought the turning in without trading away stability.
 
+**The gait turns better one way than the other (an open limitation).** Driving the policy with a
+pure turn command and measuring the yaw rate it actually achieves, one direction comes around at
+~0.29 rad/s while the other manages only ~0.10 rad/s for the same `|wz| = 0.5` request. The
+high-level controller is symmetric - it hands both sides the same command - so this is a learned
+asymmetry in the policy, not a controller bug. What's notable is that the command sampler is
+symmetric too (`wz` is drawn from `U(-0.5, 0.5)`), so it isn't that one direction was under-sampled:
+nothing in the reward enforces left/right symmetry, so PPO was free to settle into a slightly
+lopsided gait. The practical effect is that the goto controller reaches targets on the strong side
+cleanly but is sluggish coming around to the weak side.
+
 Throughout, I changed one reward term at a time - tightening the yaw kernel, gating tracking on
 uprightness, making fall termination stricter - and re-checked each change in sim before trusting it,
 so anything that hurt the gait showed up immediately instead of being buried in a long run.
